@@ -46,7 +46,7 @@ def _clip(s, n):
 
 
 def stale(state, now):
-    """Карточки без ответа старше суток и моложе двух недель: [{id, session, question, options, since, revived}], старые первыми.
+    """Карточки без ответа старше суток и моложе двух недель: [{id, request_id, session, question, options, since, revived}], старые первыми.
     Не показываем: отвеченные, сессию removed/retired, задачу в closed/archived/replied/stopped, ожидание возвращения владельца,
     вопрос, который сессия уже задала заново (он открыт сейчас)."""
     out = []
@@ -70,6 +70,6 @@ def stale(state, now):
             if k in live or k in seen:
                 continue
             seen.add(k)
-            out.append({"id": a.get("id") or "", "session": name, "question": _clip(question(a), TEXT),
+            out.append({"id": a.get("id") or "", "request_id": a.get("request_id") or "", "session": name, "question": _clip(question(a), TEXT),
                         "options": options(a), "since": since(a), "revived": k in revived})
     return sorted(out, key=lambda r: (r["since"], r["session"]))

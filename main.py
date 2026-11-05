@@ -1,76 +1,122 @@
-"""Процесс плагина «Напоминания»: отдаёт странице карточки владельцу, которые остались без ответа дольше суток. Ядро держит их
-в состоянии (sess["asks"]), но в снимок страницы они не попадают. Читает состояние ядра, ничего не пишет и не правит.
+"""Процесс плагина «Напоминания»: карточки владельцу, которые остались без ответа дольше суток. Ядро держит их в состоянии
+(sess["asks"]), но в снимок страницы они не попадают.
 
-Страница и процесс говорят по 127.0.0.1:<порт страницы + 14>; принимаются только запросы со страницы хаба (Origin)."""
-import http.server
+Процесс держит состояние ядра в памяти: целиком читает его один раз (и после ротации журнала), дальше раз в минуту
+дочитывает только новые строки журнала. Список устаревших карточек он пишет постом в канал плагина, и только когда список
+изменился: страница берёт его через саму страницу хаба (snap.feeds, hub.feed), поэтому блок работает и с телефона, и через
+прокси. Своего порта у процесса нет."""
 import json
 import os
-import threading
 import time
 
-from core import journal
+from core import journal, reducer, spool
 
 import asks
 
 STATE = os.environ.get("HUB_STATE_DIR", "")
-WEB_PORT = int(os.environ.get("HUB_WEB_PORT", "8787"))
-PORT = WEB_PORT + 14
-CACHE = 5   # с: состояние ядра читается не чаще (страница спрашивает раз в полминуты)
+NAME = os.environ.get("HUB_EXTENSION", "reminders")
+CHANNEL = NAME.split(":")[-1]
+EVERY = 60          # с: опрос журнала; от числа открытых вкладок не зависит
+POST_MAX = 19000    # знаков в посте канала (ядро принимает до 20 000)
+KIND = "stale"
+
+
+class Reader:
+    """Состояние ядра без повторного чтения всего журнала: load_state при первом опросе, после ротации (другой файл) или
+    усечения журнала; дальше - только строки, дописанные после прошлого раза."""
+
+    def __init__(self, state_dir, load=journal.load_state):
+        self.dir, self.load = state_dir, load
+        self.path = os.path.join(state_dir, "journal.jsonl")
+        self.state, self.ino, self.offset = None, None, 0
+        self.loads = 0
+
+    def _reload(self, st):
+        # Размер берётся до чтения: load_state может прочитать и то, что дописали после stat, - повтор отсекает seq.
+        self.state, self.ino, self.offset = self.load(self.dir), st.st_ino, st.st_size
+        self.loads += 1
+
+    def poll(self):
+        st = os.stat(self.path)
+        if self.state is None or st.st_ino != self.ino or st.st_size < self.offset:
+            self._reload(st)
+            return self.state
+        if st.st_size == self.offset:
+            return self.state
+        with open(self.path, "rb") as f:
+            if os.fstat(f.fileno()).st_ino != self.ino:
+                self._reload(st)
+                return self.state
+            f.seek(self.offset)
+            chunk = f.read()
+        end = chunk.rfind(b"\n")
+        if end < 0:   # строка ещё дописывается
+            return self.state
+        events = [json.loads(x) for x in chunk[:end].split(b"\n") if x.strip()]
+        events = [e for e in events if e.get("seq", 0) > self.state.get("seq", 0)]
+        if events and events[0]["seq"] != self.state.get("seq", 0) + 1:   # дыра: журнал переписан не ротацией
+            self._reload(st)
+            return self.state
+        self.offset += end + 1
+        if events:
+            self.state = reducer.fold(self.state, events)
+        return self.state
+
+
+def last_post(state):
+    """Список из последнего поста процесса в канале (после перезапуска не повторяем тот же), или None."""
+    for p in reversed((state.get("feeds") or {}).get(CHANNEL) or []):
+        if p.get("by") in (f"плагин {NAME}", f"plugin {NAME}"):
+            try:
+                d = json.loads(p.get("text") or "")
+            except ValueError:
+                continue
+            if isinstance(d, dict) and d.get("kind") == KIND and isinstance(d.get("asks"), list):
+                return d["asks"]
+    return None
+
+
+def body(rows):
+    """Текст поста: список целиком, а если не влезает в пост - старые первыми, сколько влезет."""
+    rows = list(rows)
+    while True:
+        text = json.dumps({"kind": KIND, "asks": rows}, ensure_ascii=False, separators=(",", ":"))
+        if len(text) <= POST_MAX or not rows:
+            return text
+        rows = rows[:-1]
 
 
 class Plugin:
-    def __init__(self, state_dir, load=journal.load_state, clock=time.time):
-        self.dir, self.load, self.clock = state_dir, load, clock
-        self.lock, self.cached = threading.Lock(), (0, [])
+    def __init__(self, state_dir, reader=None, put=None, clock=time.time):
+        self.reader = reader or Reader(state_dir)
+        self.put = put or (lambda data: spool.put(os.path.join(state_dir, "spool"), "ext.post", None, data, src=f"ext:{NAME}"))
+        self.clock = clock
+        self.posted = None   # что уже в канале: None - ещё не знаем (смотрим в состоянии)
 
-    def asks(self):
-        with self.lock:
-            now = self.clock()
-            if now - self.cached[0] >= CACHE:
-                self.cached = (now, asks.stale(self.load(self.dir), now))
-            return self.cached[1]
-
-    def act(self, path, origin):
-        """Запрос страницы -> (код, ответ). Только со страницы хаба этой машины."""
-        if origin not in (f"http://127.0.0.1:{WEB_PORT}", f"http://localhost:{WEB_PORT}"):
-            return 403, {"error": "только со страницы хаба"}
-        if path == "/asks":
-            try:
-                return 200, {"asks": self.asks(), "ts": self.clock()}
-            except (OSError, ValueError) as e:
-                return 503, {"error": f"состояние хаба не прочиталось: {e}"}
-        return 404, {"error": "нет такого"}
-
-
-def serve(plugin):
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def answer(self):
-            origin = self.headers.get("Origin") or ""
-            code, body = plugin.act(self.path.split("?")[0], origin)
-            data = json.dumps(body, ensure_ascii=False).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            if code != 403:
-                self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        do_GET = answer
-
-        def log_message(self, *a):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server
+    def tick(self):
+        """Один опрос: дочитать журнал, пересчитать список, написать пост, если список не тот, что уже в канале.
+        True - пост написан."""
+        state = self.reader.poll()
+        rows = asks.stale(state, self.clock())
+        if self.posted is None:
+            self.posted = last_post(state)
+        if rows == self.posted or (not rows and self.posted is None):
+            return False
+        self.put({"plugin": CHANNEL, "text": body(rows), "channel": "plugin", "owner": False, "sender": NAME})
+        self.posted = rows
+        return True
 
 
 def main():
-    serve(Plugin(STATE))
-    print(f"напоминания: страница - 127.0.0.1:{PORT}", flush=True)
+    plugin = Plugin(STATE)
+    print(f"напоминания: опрос журнала раз в {EVERY} с, список - в канал {CHANNEL}", flush=True)
     while True:
-        time.sleep(3600)
+        try:
+            plugin.tick()
+        except (OSError, ValueError, KeyError) as e:
+            print(f"напоминания: состояние хаба не прочиталось: {e}", flush=True)
+            plugin.reader.state = None
+        time.sleep(EVERY)
 
 
 if __name__ == "__main__":

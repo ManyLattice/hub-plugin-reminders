@@ -52,13 +52,28 @@ export function cardWaits(snap, now) {
 
 // Устаревшие карточки без ответа: отдаёт процесс плагина (asks.py), в снимке страницы их нет. Сверяем со снимком: сессия жива,
 // вопрос не задан заново (открытая карточка с тем же текстом)
+// Список устаревших карточек из канала плагина: последний пост процесса плагина ({kind: "stale", asks}).
+// Посты сессий (`hub post`) и других плагинов в том же канале - не он. null - такого поста среди posts нет.
+export function staleFromPosts(posts, channel) {
+  const by = new RegExp(`^(?:плагин|plugin) (?:[^\\s:]+:)?${channel}$`);
+  for (const p of [...(posts || [])].reverse()) {
+    if (!by.test(String(p?.by || ""))) continue;
+    try {
+      const d = JSON.parse(p.text);
+      if (d && d.kind === "stale" && Array.isArray(d.asks)) return d.asks;
+    } catch { /* не наш формат: ищем раньше */ }
+  }
+  return null;
+}
+
 export function staleCards(asks, snap, now) {
   const by = new Map((snap?.sessions || []).map((s) => [s.name, s]));
   const out = [];
   for (const a of asks || []) {
     const s = by.get(a.session);
     const since = Number(a.since) || 0, age = now - since;
-    if (!s || s.state === "removed" || !since || age < CARD_MAX_AGE || age >= STALE_MAX_AGE) continue;
+    if (!s || s.state === "removed" || s.retired || !since || age < CARD_MAX_AGE || age >= STALE_MAX_AGE) continue;
+    if (a.request_id && (s.answered || []).some((r) => r?.request_id === a.request_id)) continue;   // пост процесса мог отстать от снимка
     const open = (s.pending || []).some((p) => p.tool === "AskUserQuestion"
       && clip(((p.input && p.input.questions) || []).map((q) => q.question).join(" / "), ASK_MAX).toLowerCase() === String(a.question || "").toLowerCase());
     if (open) continue;

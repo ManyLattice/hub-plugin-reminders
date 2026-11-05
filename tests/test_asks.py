@@ -29,6 +29,7 @@ class StaleAsks(unittest.TestCase):
         self.assertEqual([(r["id"], r["session"]) for r in rows], [("q1001", "alpha-lab")])
         self.assertEqual(rows[0]["options"], ["Да", "Нет"])
         self.assertFalse(rows[0]["revived"])
+        self.assertEqual(rows[0]["request_id"], "r-q1001")   # страница по нему сверяет ответ в снимке
 
     def test_fresh_and_too_old_are_dropped(self):
         rows = self.rows({"s": sess([card("q1", 23, "A?"), card("q2", 25, "B?"), card("q3", 14 * 24 - 1, "C?"), card("q4", 14 * 24 + 1, "D?")])})

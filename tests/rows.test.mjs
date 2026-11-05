@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { cardWaits, cooldownLeft, COOLDOWN, isOwnerWait, ownerWaits, reaskText, remindAllRows, remindText, staleCards, textWaits, waitLabel } from "../web/rows.js";
+import { cardWaits, cooldownLeft, COOLDOWN, isOwnerWait, ownerWaits, reaskText, remindAllRows, remindText, staleCards, staleFromPosts, textWaits, waitLabel } from "../web/rows.js";
 
 const NOW = 1_800_000_000;
 const sess = (name, extra = {}) => ({ name, state: "idle", pending: [], attention: null, ...extra });
@@ -137,4 +137,27 @@ test("owner wait reminder names the wait and the way to clear it", () => {
   assert.match(t, /ответ владельца q1002/);
   assert.match(t, /hub waiting --clear/);
   assert.match(t, /«\u2014»/);
+});
+
+test("stale list comes from the plugin process's latest post in its channel, not from a session's post", () => {
+  const list = (ids) => JSON.stringify({ kind: "stale", asks: ids.map((id) => ({ id })) });
+  const posts = [
+    { id: "p1", by: "плагин acme:reminders", text: list(["q1"]) },
+    { id: "p2", by: "плагин reminders", text: list(["q2", "q3"]) },
+    { id: "p3", by: "alpha-lab", text: list(["q9"]) },
+    { id: "p4", by: "плагин other:reminders-x", text: list(["q8"]) },
+    { id: "p5", by: "плагин acme:reminders", text: "не json" },
+  ];
+  assert.deepEqual(staleFromPosts(posts, "reminders").map((a) => a.id), ["q2", "q3"]);
+  assert.deepEqual(staleFromPosts(posts.slice(0, 1), "reminders").map((a) => a.id), ["q1"]);
+  assert.deepEqual(staleFromPosts([{ by: "plugin reminders", text: list([]) }], "reminders"), []);
+  assert.equal(staleFromPosts(posts.slice(2), "reminders"), null);
+  assert.equal(staleFromPosts([], "reminders"), null);
+});
+
+test("stale cards: one the snapshot already shows answered, or of a session that handed in, is dropped before the next post", () => {
+  const snap = { sessions: [sess("alpha-lab", { answered: [{ request_id: "r-q1" }] }), sess("done", { retired: true })] };
+  const rows = staleCards([asked("q1", 2 * DAY, { request_id: "r-q1" }), asked("q2", 2 * DAY, { request_id: "r-q2" }),
+    asked("q3", 2 * DAY, { session: "done" })], snap, NOW);
+  assert.deepEqual(rows.map((r) => r.id), ["q2"]);
 });
